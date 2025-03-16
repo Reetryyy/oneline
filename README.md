@@ -1,4 +1,4 @@
-# Online Scripts for Deployed Applications
+# Oneline Scripts for Deployed Applications
 
 This repository contains scripts for deploying various applications on different operating systems.
 
@@ -13,7 +13,7 @@ Follow these steps to get started:
 
 2. Navigate into the repository folder:
     ```bash
-    cd online
+    cd oneline
     ```
 
 3. Make the script executable. For example, to make `docker-setup-ubuntu.sh` executable:
