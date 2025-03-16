@@ -34,13 +34,5 @@ Contributions are welcome! If you find a bug or want to suggest improvements, fe
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Contact
 
-For any inquiries or support, please feel free to reach out to [your-email@example.com](mailto:your-email@example.com).
 
----
-
-### Acknowledgments
-
-- Hat tip to anyone whose code was used as inspiration.
-- Special thanks to all contributors!
