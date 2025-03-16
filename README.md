@@ -8,7 +8,7 @@ Follow these steps to get started:
 
 1. Clone this repository:
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
+    git clone https://github.com/Reetryyy/oneline.git
     ```
 
 2. Navigate into the repository folder:
