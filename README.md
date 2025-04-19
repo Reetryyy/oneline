@@ -1,30 +1,17 @@
 # Oneline Scripts for Deployed Applications
 
-This repository contains scripts for deploying various applications on different operating systems.
+This repository contains online deployment scripts for various applications on different operating systems.
 
 ## Getting Started
 
 Follow these steps to get started:
 
-1. Clone this repository:
-    ```bash
-    git clone https://github.com/Reetryyy/oneline.git
+1. Choose script name, for example - **docker-setup-ubuntu.sh**
+2. Then Run:
+    ```
+    bash <(curl -s https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup-ubuntu.sh)   
     ```
 
-2. Navigate into the repository folder:
-    ```bash
-    cd oneline
-    ```
-
-3. Make the script executable. For example, to make `docker-setup-ubuntu.sh` executable:
-    ```bash
-    chmod +x docker-setup-ubuntu.sh
-    ```
-
-4. Run the script:
-    ```bash
-    ./docker-setup-ubuntu.sh
-    ```
 
 ## Contributions
 
