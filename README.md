@@ -11,6 +11,7 @@ Follow these steps to get started:
     ```
     bash <(curl -s https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup-ubuntu.sh)   
     ```
+3. That's it. Your software should be deployed upon completion. 
 
 
 ## Contributions
