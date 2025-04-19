@@ -1,6 +1,6 @@
 # Oneline Scripts for Deployed Applications
 
-This repository contains online deployment scripts for various applications on different operating systems.
+This repository contains oneline deployment scripts for various applications on different operating systems.
 
 ## Getting Started
 
