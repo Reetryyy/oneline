@@ -6,10 +6,10 @@ This repository contains oneline deployment scripts for various applications on 
 
 Follow these steps to get started:
 
-1. Choose script name, for example - **docker-setup-ubuntu.sh**
+1. Choose script name, for example - **docker-setup.sh**
 2. Then Run:
     ```
-    bash <(curl -s https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup-ubuntu.sh)   
+    bash <(curl -s https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh)   
     ```
 3. That's it. Your software should be deployed upon completion. 
 
