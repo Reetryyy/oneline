@@ -1,33 +1,84 @@
 #!/bin/bash
 
-set -e
+# Docker Installation Script
+# ==========================================
 
-# Color codes for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================================
+
+readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_NAME="docker-install"
+readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
+
+# Exit codes
+readonly EXIT_SUCCESS=0
+readonly EXIT_INVALID_ARGS=1
+readonly EXIT_UNSUPPORTED_DISTRO=2
+readonly EXIT_NETWORK_ERROR=3
+readonly EXIT_PERMISSION_ERROR=4
+readonly EXIT_INSTALLATION_ERROR=5
+
+# Color codes
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly PURPLE='\033[0;35m'
+readonly CYAN='\033[0;36m'
+readonly NC='\033[0m'
 
 # Progress tracking
-TOTAL_STEPS=8
+readonly TOTAL_STEPS=10
 CURRENT_STEP=0
+
+# Script options (set by command line flags)
+DRY_RUN=false
+VERBOSE=false
+FORCE_YES=false
+
+# ============================================================================
+# LOGGING & OUTPUT UTILITIES
+# ============================================================================
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
 
 print_step() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
-    echo -e "${BLUE}[${CURRENT_STEP}/${TOTAL_STEPS}]${NC} $1"
+    local message="$1"
+    echo -e "${BLUE}[${CURRENT_STEP}/${TOTAL_STEPS}]${NC} ${message}"
+    log "STEP ${CURRENT_STEP}/${TOTAL_STEPS}: ${message}"
 }
 
 print_success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
+    log "SUCCESS: $1"
 }
 
 print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+    log "WARNING: $1"
 }
 
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+    log "ERROR: $1"
+}
+
+print_info() {
+    echo -e "${CYAN}[INFO]${NC} $1"
+    log "INFO: $1"
+}
+
+print_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${PURPLE}[VERBOSE]${NC} $1"
+    fi
+    log "VERBOSE: $1"
 }
 
 progress_bar() {
@@ -39,8 +90,8 @@ progress_bar() {
     local remaining=$((width - completed))
     
     printf "\rProgress: ["
-    printf "%${completed}s" | tr ' ' '='
-    printf "%${remaining}s" | tr ' ' '-'
+    printf "%*s" $completed | tr ' ' '='
+    printf "%*s" $remaining | tr ' ' '-'
     printf "] %d%%" $percentage
     
     if [ $current -eq $total ]; then
@@ -48,199 +99,649 @@ progress_bar() {
     fi
 }
 
-detect_distro() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        DISTRO=$ID
-        VERSION=$VERSION_ID
-        CODENAME=${VERSION_CODENAME:-$VERSION}
-    else
-        print_error "Cannot detect Linux distribution"
-        exit 1
-    fi
-}
+# ============================================================================
+# VALIDATION & SAFETY CHECKS
+# ============================================================================
 
-setup_ubuntu_debian() {
-    # Remove old Docker packages
-    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+validate_environment() {
+    print_verbose "Validating script environment"
     
-    # Update package index
-    sudo apt-get update
-    
-    # Install dependencies
-    sudo apt-get install -y ca-certificates curl gnupg lsb-release
-    
-    # Add Docker GPG key
-    sudo mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/$DISTRO/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    
-    # Add Docker repository
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$DISTRO $CODENAME stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-    
-    # Update package index
-    sudo apt-get update
-    
-    # Install Docker
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-}
-
-setup_centos_rhel_fedora() {
-    # Remove old Docker packages
-    sudo dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-selinux docker-engine-selinux docker-engine 2>/dev/null || true
-    
-    # Install dependencies
-    sudo dnf install -y dnf-plugins-core
-    
-    # Add Docker repository
-    if [[ "$DISTRO" == "fedora" ]]; then
-        sudo dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
-    else
-        sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    # Check if running as root
+    if [[ $EUID -eq 0 ]]; then
+        print_error "This script should not be run as root for security reasons"
+        print_info "Run as a regular user with sudo privileges"
+        exit $EXIT_PERMISSION_ERROR
     fi
     
-    # Install Docker
-    sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    # Validate sudo access
+    if ! sudo -n true 2>/dev/null; then
+        print_info "Checking sudo privileges..."
+        if ! sudo -v; then
+            print_error "Sudo access required but not available"
+            exit $EXIT_PERMISSION_ERROR
+        fi
+    fi
+    
+    # Check internet connectivity
+    print_verbose "Testing internet connectivity"
+    if ! curl -s --connect-timeout 5 https://download.docker.com >/dev/null; then
+        print_error "No internet connection or Docker servers unreachable"
+        exit $EXIT_NETWORK_ERROR
+    fi
+    
+    print_success "Environment validation passed"
 }
 
-setup_opensuse() {
-    # Remove old Docker packages
-    sudo zypper remove -y docker docker-runc 2>/dev/null || true
+detect_system() {
+    print_verbose "Detecting system information"
     
-    # Add Docker repository
-    sudo zypper addrepo https://download.docker.com/linux/sles/docker-ce.repo
-    sudo zypper refresh
+    # Detect distribution
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "Cannot detect Linux distribution - /etc/os-release not found"
+        exit $EXIT_UNSUPPORTED_DISTRO
+    fi
     
-    # Install Docker
-    sudo zypper install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-}
-
-setup_arch() {
-    # Update package database
-    sudo pacman -Sy
+    # Source OS release info safely
+    local os_id os_version os_codename
+    os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    os_version=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"' || echo "")
+    os_codename=$(grep '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2 | tr -d '"' || echo "$os_version")
     
-    # Install Docker
-    sudo pacman -S --noconfirm docker docker-compose
-}
-
-install_docker() {
+    # Set global variables
+    readonly DISTRO="$os_id"
+    readonly VERSION="$os_version"
+    readonly CODENAME="$os_codename"
+    
+    # Detect architecture
+    readonly ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+    
+    print_verbose "Detected: $DISTRO $VERSION ($CODENAME) on $ARCH"
+    
+    # Validate supported distributions
     case "$DISTRO" in
-        ubuntu|debian)
-            setup_ubuntu_debian
-            ;;
-        centos|rhel|rocky|almalinux)
-            setup_centos_rhel_fedora
-            ;;
-        fedora)
-            setup_centos_rhel_fedora
-            ;;
-        opensuse*|sles)
-            setup_opensuse
-            ;;
-        arch|manjaro)
-            setup_arch
+        ubuntu|debian|centos|rhel|rocky|almalinux|fedora|opensuse*|sles|arch|manjaro)
+            print_success "Supported distribution detected: $DISTRO $VERSION"
             ;;
         *)
             print_error "Unsupported distribution: $DISTRO"
-            exit 1
+            print_info "Supported: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, Fedora, openSUSE, SLES, Arch, Manjaro"
+            exit $EXIT_UNSUPPORTED_DISTRO
             ;;
     esac
 }
 
-configure_docker() {
-    # Add user to docker group
-    sudo usermod -aG docker $USER
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+confirm_action() {
+    local message="$1"
     
-    # Start and enable Docker service
-    sudo systemctl start docker
-    sudo systemctl enable docker
+    if [[ "$FORCE_YES" == true ]]; then
+        return 0
+    fi
+    
+    echo -en "${YELLOW}[CONFIRM]${NC} $message (y/N): "
+    read -r response
+    case "$response" in
+        [yY]|[yY][eE][sS])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
-verify_installation() {
-    # Test Docker installation
-    if docker --version >/dev/null 2>&1; then
-        DOCKER_VERSION=$(docker --version | cut -d' ' -f3 | tr -d ',')
-        print_success "Docker $DOCKER_VERSION installed successfully"
+retry_command() {
+    local max_attempts=$1
+    local delay=$2
+    shift 2
+    local cmd=("$@")
+    
+    for ((i=1; i<=max_attempts; i++)); do
+        print_verbose "Attempt $i/$max_attempts: ${cmd[*]}"
+        
+        if "${cmd[@]}"; then
+            return 0
+        else
+            local exit_code=$?
+            if [[ $i -lt $max_attempts ]]; then
+                print_warning "Command failed (attempt $i/$max_attempts), retrying in ${delay}s..."
+                sleep "$delay"
+            else
+                print_error "Command failed after $max_attempts attempts"
+                return $exit_code
+            fi
+        fi
+    done
+}
+
+# ============================================================================
+# DOCKER REMOVAL FUNCTIONS
+# ============================================================================
+
+remove_old_docker_ubuntu_debian() {
+    print_verbose "Removing old Docker packages (Ubuntu/Debian)"
+    
+    local old_packages=(
+        "docker" "docker-engine" "docker.io" "containerd" "runc"
+        "docker-doc" "docker-compose" "podman-docker"
+    )
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "DRY RUN: Would remove packages: ${old_packages[*]}"
+        return 0
+    fi
+    
+    # Check if any packages are installed before attempting removal
+    local installed_packages=()
+    for package in "${old_packages[@]}"; do
+        if dpkg -l "$package" 2>/dev/null | grep -q '^ii'; then
+            installed_packages+=("$package")
+        fi
+    done
+    
+    if [[ ${#installed_packages[@]} -gt 0 ]]; then
+        print_info "Removing old Docker packages: ${installed_packages[*]}"
+        retry_command 3 2 sudo apt-get remove -y "${installed_packages[@]}"
     else
-        print_error "Docker installation failed"
+        print_verbose "No old Docker packages found to remove"
+    fi
+}
+
+remove_old_docker_rhel_family() {
+    print_verbose "Removing old Docker packages (RHEL family)"
+    
+    local old_packages=(
+        "docker" "docker-client" "docker-client-latest" "docker-common"
+        "docker-latest" "docker-latest-logrotate" "docker-logrotate"
+        "docker-selinux" "docker-engine-selinux" "docker-engine"
+        "podman-docker"
+    )
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "DRY RUN: Would remove packages: ${old_packages[*]}"
+        return 0
+    fi
+    
+    # Use dnf for modern systems, fallback to yum
+    local pkg_manager="dnf"
+    if ! command -v dnf >/dev/null 2>&1; then
+        pkg_manager="yum"
+        print_verbose "Using yum as package manager"
+    fi
+    
+    retry_command 3 2 sudo "$pkg_manager" remove -y "${old_packages[@]}" 2>/dev/null || true
+}
+
+remove_old_docker_arch() {
+    print_verbose "Removing old Docker packages (Arch)"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "DRY RUN: Would remove old docker packages"
+        return 0
+    fi
+    
+    sudo pacman -Rns --noconfirm docker docker-compose 2>/dev/null || true
+}
+
+# ============================================================================
+# DOCKER INSTALLATION FUNCTIONS
+# ============================================================================
+
+install_docker_ubuntu_debian() {
+    print_verbose "Installing Docker on Ubuntu/Debian"
+    
+    # Update package index
+    print_info "Updating package index..."
+    retry_command 3 5 sudo apt-get update
+    
+    # Install dependencies
+    local dependencies=(
+        "ca-certificates" "curl" "gnupg" "lsb-release"
+        "software-properties-common" "apt-transport-https"
+    )
+    
+    print_info "Installing dependencies: ${dependencies[*]}"
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo apt-get install -y "${dependencies[@]}"
+    fi
+    
+    # Setup Docker repository
+    print_info "Setting up Docker repository..."
+    if [[ "$DRY_RUN" == false ]]; then
+        # Create keyrings directory
+        sudo mkdir -p /etc/apt/keyrings
+        
+        # Download and install GPG key
+        curl -fsSL "https://download.docker.com/linux/${DISTRO}/gpg" | \
+            sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+        
+        # Set proper permissions
+        sudo chmod a+r /etc/apt/keyrings/docker.gpg
+        
+        # Add repository
+        local repo_line="deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${DISTRO} ${CODENAME} stable"
+        echo "$repo_line" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+        
+        # Update package index with new repository
+        retry_command 3 5 sudo apt-get update
+    fi
+    
+    # Install Docker packages
+    local docker_packages=(
+        "docker-ce" "docker-ce-cli" "containerd.io"
+        "docker-buildx-plugin" "docker-compose-plugin"
+    )
+    
+    print_info "Installing Docker packages: ${docker_packages[*]}"
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo apt-get install -y "${docker_packages[@]}"
+    fi
+}
+
+install_docker_rhel_family() {
+    print_verbose "Installing Docker on RHEL family"
+    
+    # Determine package manager
+    local pkg_manager="dnf"
+    if ! command -v dnf >/dev/null 2>&1; then
+        pkg_manager="yum"
+        print_verbose "Falling back to yum package manager"
+    fi
+    
+    # Install dependencies
+    print_info "Installing dependencies..."
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo "$pkg_manager" install -y "${pkg_manager}-plugins-core"
+    fi
+    
+    # Add Docker repository
+    print_info "Adding Docker repository..."
+    if [[ "$DRY_RUN" == false ]]; then
+        local repo_url
+        case "$DISTRO" in
+            fedora)
+                repo_url="https://download.docker.com/linux/fedora/docker-ce.repo"
+                ;;
+            centos|rhel|rocky|almalinux)
+                repo_url="https://download.docker.com/linux/centos/docker-ce.repo"
+                ;;
+        esac
+        
+        retry_command 3 5 sudo "$pkg_manager" config-manager --add-repo "$repo_url"
+    fi
+    
+    # Install Docker packages
+    local docker_packages=(
+        "docker-ce" "docker-ce-cli" "containerd.io"
+        "docker-buildx-plugin" "docker-compose-plugin"
+    )
+    
+    print_info "Installing Docker packages: ${docker_packages[*]}"
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo "$pkg_manager" install -y "${docker_packages[@]}"
+    fi
+}
+
+install_docker_opensuse() {
+    print_verbose "Installing Docker on openSUSE/SLES"
+    
+    print_info "Adding Docker repository..."
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo zypper addrepo https://download.docker.com/linux/sles/docker-ce.repo
+        retry_command 3 5 sudo zypper refresh
+    fi
+    
+    # Install Docker packages
+    local docker_packages=(
+        "docker-ce" "docker-ce-cli" "containerd.io"
+        "docker-buildx-plugin" "docker-compose-plugin"
+    )
+    
+    print_info "Installing Docker packages: ${docker_packages[*]}"
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo zypper install -y "${docker_packages[@]}"
+    fi
+}
+
+install_docker_arch() {
+    print_verbose "Installing Docker on Arch Linux"
+    
+    # Update package database
+    print_info "Updating package database..."
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo pacman -Sy
+    fi
+    
+    # Install Docker packages
+    local docker_packages=("docker" "docker-compose")
+    
+    print_info "Installing Docker packages: ${docker_packages[*]}"
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo pacman -S --noconfirm "${docker_packages[@]}"
+    fi
+}
+
+# ============================================================================
+# MAIN INSTALLATION LOGIC
+# ============================================================================
+
+remove_old_docker() {
+    if ! confirm_action "Remove old Docker installations?"; then
+        print_info "Skipping removal of old Docker installations"
+        return 0
+    fi
+    
+    case "$DISTRO" in
+        ubuntu|debian)
+            remove_old_docker_ubuntu_debian
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            remove_old_docker_rhel_family
+            ;;
+        opensuse*|sles)
+            # openSUSE handles this during installation
+            print_verbose "openSUSE will handle old package removal automatically"
+            ;;
+        arch|manjaro)
+            remove_old_docker_arch
+            ;;
+    esac
+    
+    print_success "Old Docker packages removed"
+}
+
+install_docker() {
+    print_verbose "Starting Docker installation for $DISTRO"
+    
+    case "$DISTRO" in
+        ubuntu|debian)
+            install_docker_ubuntu_debian
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            install_docker_rhel_family
+            ;;
+        opensuse*|sles)
+            install_docker_opensuse
+            ;;
+        arch|manjaro)
+            install_docker_arch
+            ;;
+        *)
+            print_error "Installation method not implemented for: $DISTRO"
+            exit $EXIT_UNSUPPORTED_DISTRO
+            ;;
+    esac
+    
+    print_success "Docker packages installed successfully"
+}
+
+configure_docker_service() {
+    print_verbose "Configuring Docker service"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "DRY RUN: Would configure Docker service and add user to docker group"
+        return 0
+    fi
+    
+    # Add user to docker group
+    print_info "Adding user '$USER' to docker group..."
+    sudo usermod -aG docker "$USER"
+    
+    # Start and enable Docker service
+    print_info "Starting Docker service..."
+    sudo systemctl start docker
+    
+    print_info "Enabling Docker service for auto-start..."
+    sudo systemctl enable docker
+    
+    # Wait for service to be ready
+    local max_wait=30
+    local wait_time=0
+    while ! sudo systemctl is-active --quiet docker && [[ $wait_time -lt $max_wait ]]; do
+        sleep 1
+        wait_time=$((wait_time + 1))
+    done
+    
+    if ! sudo systemctl is-active --quiet docker; then
+        print_error "Docker service failed to start within ${max_wait}s"
         return 1
     fi
     
-    # Test Docker Compose installation
-    if docker compose version >/dev/null 2>&1; then
-        COMPOSE_VERSION=$(docker compose version --short)
-        print_success "Docker Compose $COMPOSE_VERSION installed successfully"
+    print_success "Docker service configured and running"
+}
+
+verify_installation() {
+    print_verbose "Verifying Docker installation"
+    
+    local verification_failed=false
+    
+    # Test Docker version
+    if docker --version >/dev/null 2>&1; then
+        local docker_version
+        docker_version=$(docker --version | cut -d' ' -f3 | tr -d ',')
+        print_success "Docker $docker_version installed and accessible"
     else
-        print_error "Docker Compose installation failed"
+        print_error "Docker command not accessible"
+        verification_failed=true
+    fi
+    
+    # Test Docker Compose version
+    if docker compose version >/dev/null 2>&1; then
+        local compose_version
+        compose_version=$(docker compose version --short 2>/dev/null || echo "unknown")
+        print_success "Docker Compose $compose_version installed and accessible"
+    else
+        print_error "Docker Compose not accessible"
+        verification_failed=true
+    fi
+    
+    # Test Docker daemon connectivity
+    if docker info >/dev/null 2>&1; then
+        print_success "Docker daemon is running and accessible"
+    else
+        print_warning "Docker daemon not accessible (may require logout/login)"
+    fi
+    
+    if [[ "$verification_failed" == true ]]; then
         return 1
+    fi
+}
+
+run_docker_test() {
+    print_verbose "Running Docker functionality test"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        print_info "DRY RUN: Would test Docker with hello-world container"
+        return 0
+    fi
+    
+    print_info "Testing Docker with hello-world container..."
+    
+    # Try to run hello-world container
+    if timeout 60 docker run --rm hello-world >/dev/null 2>&1; then
+        print_success "Docker test completed successfully"
+    else
+        print_warning "Docker test failed - you may need to logout and login again"
+        print_info "Try running: newgrp docker"
+    fi
+}
+
+# ============================================================================
+# MAIN EXECUTION FLOW
+# ============================================================================
+
+show_usage() {
+    cat << EOF
+Docker Installation Script v${SCRIPT_VERSION}
+
+Usage: $0 [OPTIONS]
+
+OPTIONS:
+    --dry-run       Show what would be done without executing
+    --verbose       Enable verbose output
+    --yes           Skip confirmation prompts
+    --help          Show this help message
+
+EXAMPLES:
+    $0                    # Interactive installation
+    $0 --verbose          # Installation with detailed output
+    $0 --dry-run          # Preview what will be installed
+    $0 --yes --verbose    # Automated verbose installation
+
+SUPPORTED DISTRIBUTIONS:
+    - Ubuntu 20.04+ (including 24.04 LTS)
+    - Debian 11+
+    - CentOS 8+, RHEL 8+
+    - Rocky Linux 8+, AlmaLinux 8+
+    - Fedora 36+
+    - openSUSE Leap 15+, SLES 15+
+    - Arch Linux, Manjaro
+
+LOG FILE: $LOG_FILE
+EOF
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dry-run)
+                DRY_RUN=true
+                print_info "Dry run mode enabled"
+                shift
+                ;;
+            --verbose)
+                VERBOSE=true
+                print_info "Verbose mode enabled"
+                shift
+                ;;
+            --yes)
+                FORCE_YES=true
+                print_info "Auto-confirmation enabled"
+                shift
+                ;;
+            --help|-h)
+                show_usage
+                exit $EXIT_SUCCESS
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                show_usage
+                exit $EXIT_INVALID_ARGS
+                ;;
+        esac
+    done
+}
+
+show_summary() {
+    echo
+    echo "Installation Summary"
+    echo "==================="
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        docker --version 2>/dev/null || echo "Docker: Not accessible"
+        docker compose version 2>/dev/null || echo "Docker Compose: Not accessible"
+        
+        echo
+        echo "System Information:"
+        echo "  Distribution: $DISTRO $VERSION"
+        echo "  Architecture: $ARCH"
+        echo "  User: $USER"
+        echo "  Log file: $LOG_FILE"
+    else
+        echo "DRY RUN completed - no changes made"
+    fi
+    
+    echo
+    if [[ "$DRY_RUN" == false ]]; then
+        print_success "Docker installation completed successfully!"
+        print_warning "IMPORTANT: Log out and log back in to use Docker without sudo"
+        print_info "Or run: newgrp docker"
     fi
 }
 
 main() {
+    # Initialize logging
+    echo "Docker Installation Script v${SCRIPT_VERSION} started at $(date)" > "$LOG_FILE"
+    
     echo "Docker Installation Script"
     echo "=========================="
+    echo
     
-    print_step "Detecting Linux distribution"
-    detect_distro
-    print_success "Detected: $DISTRO $VERSION"
+    # Step 1: Parse command line arguments
+    print_step "Parsing command line arguments"
+    parse_arguments "$@"
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    print_step "Checking system requirements"
-    if [[ $EUID -eq 0 ]]; then
-        print_error "This script should not be run as root"
-        exit 1
+    # Step 2: Environment validation
+    print_step "Validating environment and permissions"
+    validate_environment
+    progress_bar $CURRENT_STEP $TOTAL_STEPS
+    
+    # Step 3: System detection
+    print_step "Detecting system configuration"
+    detect_system
+    progress_bar $CURRENT_STEP $TOTAL_STEPS
+    
+    # Step 4: Display installation plan
+    print_step "Preparing installation plan"
+    echo "  Target system: $DISTRO $VERSION ($ARCH)"
+    echo "  Installation mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "LIVE")"
+    echo "  Log file: $LOG_FILE"
+    progress_bar $CURRENT_STEP $TOTAL_STEPS
+    
+    # Step 5: Confirm installation
+    print_step "Confirming installation"
+    if ! confirm_action "Proceed with Docker installation on $DISTRO $VERSION?"; then
+        print_info "Installation cancelled by user"
+        exit $EXIT_SUCCESS
     fi
-    print_success "System requirements check passed"
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
+    # Step 6: Remove old Docker installations
     print_step "Removing old Docker installations"
+    remove_old_docker
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    print_step "Installing system dependencies"
-    progress_bar $CURRENT_STEP $TOTAL_STEPS
-    
-    print_step "Adding Docker repository"
-    progress_bar $CURRENT_STEP $TOTAL_STEPS
-    
+    # Step 7: Install Docker
     print_step "Installing Docker and Docker Compose"
     install_docker
-    print_success "Docker packages installed"
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
+    # Step 8: Configure Docker service
     print_step "Configuring Docker service"
-    configure_docker
-    print_success "Docker service configured and started"
+    configure_docker_service
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
+    # Step 9: Verify installation
     print_step "Verifying installation"
     verify_installation
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    echo
-    echo "Installation Summary:"
-    echo "===================="
-    docker --version
-    docker compose version
-    echo
-    print_success "Docker installation completed successfully"
-    print_warning "Please log out and log back in to use Docker without sudo"
+    # Step 10: Test Docker functionality
+    print_step "Testing Docker functionality"
+    run_docker_test
+    progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Test Docker access
-    if groups $USER | grep -q docker; then
-        echo
-        echo "Testing Docker access..."
-        if newgrp docker <<< 'docker run --rm hello-world' 2>/dev/null; then
-            print_success "Docker is working correctly"
-        else
-            print_warning "Docker test failed - you may need to restart your session"
-        fi
-    fi
+    # Show final summary
+    show_summary
 }
 
-# Check if running with bash
-if [ -z "$BASH_VERSION" ]; then
-    print_error "This script requires bash"
-    exit 1
+# ============================================================================
+# SCRIPT ENTRY POINT
+# ============================================================================
+
+# Validate shell environment
+if [[ -z "${BASH_VERSION:-}" ]]; then
+    echo "ERROR: This script requires bash" >&2
+    exit $EXIT_INVALID_ARGS
 fi
 
-# Run main function
+# Set up error handling
+trap 'print_error "Script interrupted"; exit 130' INT TERM
+trap 'if [[ $? -ne 0 ]]; then print_error "Script failed - check log: $LOG_FILE"; fi' EXIT
+
+# Execute main function
 main "$@"
