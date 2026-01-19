@@ -9,7 +9,7 @@ Follow these steps to get started:
 1. Choose script name, for example - **docker-setup.sh**
 2. Then Run:
     ```
-    bash <(curl -s https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh)   
+    wget -qO- https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh | bash  
     ```
 3. That's it. Your software should be deployed upon completion. 
 
