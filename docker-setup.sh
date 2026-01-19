@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.4"
+readonly SCRIPT_VERSION="2.1.5"
 readonly SCRIPT_NAME="docker-install"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
@@ -422,10 +422,32 @@ confirm_action() {
         return 0
     fi
     
-    echo -en "${YELLOW}[CONFIRM]${NC} $message (y/N): "
-    read -r response < /dev/tty
+    local response=""
+    # Print prompt to stderr to ensure visibility even if stdout is redirected
+    echo -en "${YELLOW}[CONFIRM]${NC} $message (y/N): " >&2
+    
+    # Check if we have a controlling terminal
+    if [[ -c /dev/tty ]]; then
+        # Read directly from terminal, bypassing any pipes
+        if ! read -r response < /dev/tty; then
+            print_error "Failed to read confirmation from /dev/tty"
+            return 1
+        fi
+    elif [[ -t 0 ]]; then
+        # Standard interactive input
+        read -r response
+    else
+        # No terminal detected
+        print_error "Installation requires interactive confirmation but no terminal was detected."
+        print_info "Run with --yes to bypass confirmation: $0 --yes"
+        return 1
+    fi
+
+    # Convert to lowercase (Bash 4+)
+    response=$(echo "$response" | tr '[:upper:]' '[:lower:]')
+    
     case "$response" in
-        [yY]|[yY][eE][sS])
+        y|yes)
             return 0
             ;;
         *)
