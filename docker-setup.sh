@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="docker-install"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
@@ -20,6 +20,7 @@ readonly EXIT_UNSUPPORTED_DISTRO=2
 readonly EXIT_NETWORK_ERROR=3
 readonly EXIT_PERMISSION_ERROR=4
 readonly EXIT_INSTALLATION_ERROR=5
+readonly EXIT_MISSING_DEPS=6
 
 # Color codes
 readonly RED='\033[0;31m'
@@ -31,7 +32,7 @@ readonly CYAN='\033[0;36m'
 readonly NC='\033[0m'
 
 # Progress tracking
-readonly TOTAL_STEPS=10
+readonly TOTAL_STEPS=11
 CURRENT_STEP=0
 
 # Script options (set by command line flags)
@@ -103,6 +104,28 @@ progress_bar() {
 # VALIDATION & SAFETY CHECKS
 # ============================================================================
 
+check_required_commands() {
+    print_verbose "Checking for required system commands"
+    
+    local required_commands=("curl" "grep" "cut" "tr" "tee" "usermod" "systemctl")
+    local missing_commands=()
+    
+    for cmd in "${required_commands[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_commands+=("$cmd")
+            print_verbose "Missing required command: $cmd"
+        fi
+    done
+    
+    if [[ ${#missing_commands[@]} -gt 0 ]]; then
+        print_error "Missing required commands: ${missing_commands[*]}"
+        print_info "These commands are necessary for the installation process"
+        exit $EXIT_MISSING_DEPS
+    fi
+    
+    print_success "All required commands are available"
+}
+
 validate_environment() {
     print_verbose "Validating script environment"
     
@@ -121,6 +144,11 @@ validate_environment() {
             exit $EXIT_PERMISSION_ERROR
         fi
     fi
+    
+    # Keep sudo alive in background
+    (while true; do sudo -n true; sleep 50; done 2>/dev/null) &
+    local sudo_pid=$!
+    trap "kill $sudo_pid 2>/dev/null || true" EXIT
     
     # Check internet connectivity
     print_verbose "Testing internet connectivity"
@@ -147,13 +175,31 @@ detect_system() {
     os_version=$(grep '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"' || echo "")
     os_codename=$(grep '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2 | tr -d '"' || echo "$os_version")
     
+    # Handle Raspberry Pi OS detection
+    if [[ "$os_id" == "raspbian" ]]; then
+        print_verbose "Detected Raspberry Pi OS (based on Debian)"
+        os_id="debian"
+    fi
+    
     # Set global variables
     readonly DISTRO="$os_id"
     readonly VERSION="$os_version"
     readonly CODENAME="$os_codename"
     
-    # Detect architecture
-    readonly ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+    # Detect architecture with fallback
+    if command -v dpkg >/dev/null 2>&1; then
+        readonly ARCH=$(dpkg --print-architecture)
+    else
+        local arch_raw
+        arch_raw=$(uname -m)
+        case "$arch_raw" in
+            x86_64) readonly ARCH="amd64" ;;
+            aarch64|arm64) readonly ARCH="arm64" ;;
+            armv7l) readonly ARCH="armhf" ;;
+            armv6l) readonly ARCH="armel" ;;
+            *) readonly ARCH="$arch_raw" ;;
+        esac
+    fi
     
     print_verbose "Detected: $DISTRO $VERSION ($CODENAME) on $ARCH"
     
@@ -164,8 +210,123 @@ detect_system() {
             ;;
         *)
             print_error "Unsupported distribution: $DISTRO"
-            print_info "Supported: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, Fedora, openSUSE, SLES, Arch, Manjaro"
+            print_info "Supported: Ubuntu, Debian, Raspberry Pi OS, CentOS, RHEL, Rocky, AlmaLinux, Fedora, openSUSE, SLES, Arch, Manjaro"
             exit $EXIT_UNSUPPORTED_DISTRO
+            ;;
+    esac
+}
+
+# ============================================================================
+# DEPENDENCY INSTALLATION
+# ============================================================================
+
+install_dependencies_debian() {
+    print_verbose "Checking and installing dependencies for Debian/Ubuntu/Raspberry Pi OS"
+    
+    local required_deps=(
+        "ca-certificates"
+        "curl"
+        "gnupg"
+        "lsb-release"
+        "software-properties-common"
+        "apt-transport-https"
+    )
+    
+    local missing_deps=()
+    
+    # Check which dependencies are missing
+    for dep in "${required_deps[@]}"; do
+        if ! dpkg -l "$dep" 2>/dev/null | grep -q '^ii'; then
+            missing_deps+=("$dep")
+            print_verbose "Missing dependency: $dep"
+        fi
+    done
+    
+    if [[ ${#missing_deps[@]} -eq 0 ]]; then
+        print_success "All dependencies already installed"
+        return 0
+    fi
+    
+    print_info "Installing missing dependencies: ${missing_deps[*]}"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo apt-get update
+        retry_command 3 5 sudo apt-get install -y "${missing_deps[@]}"
+    fi
+    
+    print_success "Dependencies installed successfully"
+}
+
+install_dependencies_rhel() {
+    print_verbose "Checking and installing dependencies for RHEL family"
+    
+    local pkg_manager="dnf"
+    if ! command -v dnf >/dev/null 2>&1; then
+        pkg_manager="yum"
+        print_verbose "Using yum as package manager"
+    fi
+    
+    local required_deps=(
+        "${pkg_manager}-plugins-core"
+        "ca-certificates"
+        "curl"
+    )
+    
+    print_info "Installing dependencies: ${required_deps[*]}"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo "$pkg_manager" install -y "${required_deps[@]}"
+    fi
+    
+    print_success "Dependencies installed successfully"
+}
+
+install_dependencies_opensuse() {
+    print_verbose "Checking and installing dependencies for openSUSE/SLES"
+    
+    local required_deps=("ca-certificates" "curl")
+    
+    print_info "Installing dependencies: ${required_deps[*]}"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo zypper install -y "${required_deps[@]}"
+    fi
+    
+    print_success "Dependencies installed successfully"
+}
+
+install_dependencies_arch() {
+    print_verbose "Checking and installing dependencies for Arch Linux"
+    
+    local required_deps=("ca-certificates" "curl")
+    
+    print_info "Installing dependencies: ${required_deps[*]}"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        retry_command 3 5 sudo pacman -S --needed --noconfirm "${required_deps[@]}"
+    fi
+    
+    print_success "Dependencies installed successfully"
+}
+
+install_dependencies() {
+    print_verbose "Installing distribution-specific dependencies"
+    
+    case "$DISTRO" in
+        ubuntu|debian)
+            install_dependencies_debian
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            install_dependencies_rhel
+            ;;
+        opensuse*|sles)
+            install_dependencies_opensuse
+            ;;
+        arch|manjaro)
+            install_dependencies_arch
+            ;;
+        *)
+            print_warning "No dependency installation defined for: $DISTRO"
             ;;
     esac
 }
@@ -222,7 +383,7 @@ retry_command() {
 # ============================================================================
 
 remove_old_docker_ubuntu_debian() {
-    print_verbose "Removing old Docker packages (Ubuntu/Debian)"
+    print_verbose "Removing old Docker packages (Ubuntu/Debian/Raspberry Pi OS)"
     
     local old_packages=(
         "docker" "docker-engine" "docker.io" "containerd" "runc"
@@ -291,34 +452,26 @@ remove_old_docker_arch() {
 # ============================================================================
 
 install_docker_ubuntu_debian() {
-    print_verbose "Installing Docker on Ubuntu/Debian"
+    print_verbose "Installing Docker on Ubuntu/Debian/Raspberry Pi OS"
     
     # Update package index
     print_info "Updating package index..."
     retry_command 3 5 sudo apt-get update
     
-    # Install dependencies
-    local dependencies=(
-        "ca-certificates" "curl" "gnupg" "lsb-release"
-        "software-properties-common" "apt-transport-https"
-    )
-    
-    print_info "Installing dependencies: ${dependencies[*]}"
-    if [[ "$DRY_RUN" == false ]]; then
-        retry_command 3 5 sudo apt-get install -y "${dependencies[@]}"
-    fi
-    
     # Setup Docker repository
     print_info "Setting up Docker repository..."
     if [[ "$DRY_RUN" == false ]]; then
-        # Create keyrings directory
-        sudo mkdir -p /etc/apt/keyrings
+        # Create keyrings directory with secure permissions
+        sudo install -m 0755 -d /etc/apt/keyrings
         
-        # Download and install GPG key
-        curl -fsSL "https://download.docker.com/linux/${DISTRO}/gpg" | \
-            sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg
+        # Download and install GPG key with error handling
+        if ! curl -fsSL "https://download.docker.com/linux/${DISTRO}/gpg" | \
+            sudo gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg 2>/dev/null; then
+            print_error "Failed to download Docker GPG key"
+            exit $EXIT_INSTALLATION_ERROR
+        fi
         
-        # Set proper permissions
+        # Set proper permissions (readable by all)
         sudo chmod a+r /etc/apt/keyrings/docker.gpg
         
         # Add repository
@@ -349,12 +502,6 @@ install_docker_rhel_family() {
     if ! command -v dnf >/dev/null 2>&1; then
         pkg_manager="yum"
         print_verbose "Falling back to yum package manager"
-    fi
-    
-    # Install dependencies
-    print_info "Installing dependencies..."
-    if [[ "$DRY_RUN" == false ]]; then
-        retry_command 3 5 sudo "$pkg_manager" install -y "${pkg_manager}-plugins-core"
     fi
     
     # Add Docker repository
@@ -539,7 +686,7 @@ verify_installation() {
     fi
     
     # Test Docker daemon connectivity
-    if docker info >/dev/null 2>&1; then
+    if sudo docker info >/dev/null 2>&1; then
         print_success "Docker daemon is running and accessible"
     else
         print_warning "Docker daemon not accessible (may require logout/login)"
@@ -560,8 +707,8 @@ run_docker_test() {
     
     print_info "Testing Docker with hello-world container..."
     
-    # Try to run hello-world container
-    if timeout 60 docker run --rm hello-world >/dev/null 2>&1; then
+    # Try to run hello-world container with sudo (since user may not be in docker group yet)
+    if timeout 60 sudo docker run --rm hello-world >/dev/null 2>&1; then
         print_success "Docker test completed successfully"
     else
         print_warning "Docker test failed - you may need to logout and login again"
@@ -594,6 +741,7 @@ EXAMPLES:
 SUPPORTED DISTRIBUTIONS:
     - Ubuntu 20.04+ (including 24.04 LTS)
     - Debian 11+
+    - Raspberry Pi OS (Debian-based)
     - CentOS 8+, RHEL 8+
     - Rocky Linux 8+, AlmaLinux 8+
     - Fedora 36+
@@ -675,24 +823,34 @@ main() {
     parse_arguments "$@"
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 2: Environment validation
+    # Step 2: Check required commands
+    print_step "Checking required system commands"
+    check_required_commands
+    progress_bar $CURRENT_STEP $TOTAL_STEPS
+    
+    # Step 3: Environment validation
     print_step "Validating environment and permissions"
     validate_environment
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 3: System detection
+    # Step 4: System detection
     print_step "Detecting system configuration"
     detect_system
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 4: Display installation plan
+    # Step 5: Install dependencies
+    print_step "Installing required dependencies"
+    install_dependencies
+    progress_bar $CURRENT_STEP $TOTAL_STEPS
+    
+    # Step 6: Display installation plan
     print_step "Preparing installation plan"
     echo "  Target system: $DISTRO $VERSION ($ARCH)"
     echo "  Installation mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "LIVE")"
     echo "  Log file: $LOG_FILE"
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 5: Confirm installation
+    # Step 7: Confirm installation
     print_step "Confirming installation"
     if ! confirm_action "Proceed with Docker installation on $DISTRO $VERSION?"; then
         print_info "Installation cancelled by user"
@@ -700,27 +858,27 @@ main() {
     fi
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 6: Remove old Docker installations
+    # Step 8: Remove old Docker installations
     print_step "Removing old Docker installations"
     remove_old_docker
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 7: Install Docker
+    # Step 9: Install Docker
     print_step "Installing Docker and Docker Compose"
     install_docker
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 8: Configure Docker service
+    # Step 10: Configure Docker service
     print_step "Configuring Docker service"
     configure_docker_service
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 9: Verify installation
+    # Step 11: Verify installation
     print_step "Verifying installation"
     verify_installation
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 10: Test Docker functionality
+    # Step 12: Test Docker functionality
     print_step "Testing Docker functionality"
     run_docker_test
     progress_bar $CURRENT_STEP $TOTAL_STEPS
