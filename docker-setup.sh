@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.2"
+readonly SCRIPT_VERSION="2.1.3"
 readonly SCRIPT_NAME="docker-install"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
@@ -221,7 +221,18 @@ validate_environment() {
     
     # Check internet connectivity
     print_verbose "Testing internet connectivity"
-    if ! curl -s --connect-timeout 5 https://download.docker.com >/dev/null; then
+    local connected=false
+    if command -v curl >/dev/null 2>&1; then
+        if curl -s --connect-timeout 5 https://download.docker.com >/dev/null; then
+            connected=true
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -q --spider --timeout=5 https://download.docker.com >/dev/null; then
+            connected=true
+        fi
+    fi
+
+    if [[ "$connected" == false ]]; then
         print_error "No internet connection or Docker servers unreachable"
         exit $EXIT_NETWORK_ERROR
     fi
@@ -880,6 +891,10 @@ show_summary() {
 }
 
 main() {
+    # Step 0: Ensure curl is present (crucial for installation)
+    # This must run before any other logic that might depend on curl
+    install_curl_if_missing
+
     # Initialize logging
     echo "Docker Installation Script v${SCRIPT_VERSION} started at $(date)" > "$LOG_FILE"
     
@@ -892,8 +907,6 @@ main() {
     parse_arguments "$@"
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 1.5: Install curl if missing (before other checks)
-    install_curl_if_missing
     
     # Step 2: Check required commands
     print_step "Checking required system commands"
