@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 readonly SCRIPT_NAME="docker-install"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
@@ -107,9 +107,10 @@ progress_bar() {
 check_required_commands() {
     print_verbose "Checking for required system commands"
     
-    local required_commands=("curl" "grep" "cut" "tr" "tee" "usermod" "systemctl")
+    local required_commands=("grep" "cut" "tr" "tee" "usermod" "systemctl")
     local missing_commands=()
     
+    # Check basic commands (excluding curl which we'll handle separately)
     for cmd in "${required_commands[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing_commands+=("$cmd")
@@ -123,7 +124,48 @@ check_required_commands() {
         exit $EXIT_MISSING_DEPS
     fi
     
+    # Handle curl separately - install if missing
+    if ! command -v curl >/dev/null 2>&1; then
+        print_warning "curl is not installed - attempting to install it..."
+        install_curl_bootstrap
+    fi
+    
     print_success "All required commands are available"
+}
+
+install_curl_bootstrap() {
+    print_verbose "Installing curl as a prerequisite"
+    
+    # Detect package manager and install curl
+    if command -v apt-get >/dev/null 2>&1; then
+        print_info "Using apt-get to install curl..."
+        sudo apt-get update -qq || true
+        sudo apt-get install -y curl
+    elif command -v dnf >/dev/null 2>&1; then
+        print_info "Using dnf to install curl..."
+        sudo dnf install -y curl
+    elif command -v yum >/dev/null 2>&1; then
+        print_info "Using yum to install curl..."
+        sudo yum install -y curl
+    elif command -v zypper >/dev/null 2>&1; then
+        print_info "Using zypper to install curl..."
+        sudo zypper install -y curl
+    elif command -v pacman >/dev/null 2>&1; then
+        print_info "Using pacman to install curl..."
+        sudo pacman -Sy --noconfirm curl
+    else
+        print_error "Cannot determine package manager to install curl"
+        print_info "Please install curl manually: sudo apt install curl"
+        exit $EXIT_MISSING_DEPS
+    fi
+    
+    # Verify curl installation
+    if ! command -v curl >/dev/null 2>&1; then
+        print_error "Failed to install curl"
+        exit $EXIT_MISSING_DEPS
+    fi
+    
+    print_success "curl installed successfully"
 }
 
 validate_environment() {
