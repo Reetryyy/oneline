@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.3"
+readonly SCRIPT_VERSION="2.1.4"
 readonly SCRIPT_NAME="docker-install"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
@@ -423,7 +423,7 @@ confirm_action() {
     fi
     
     echo -en "${YELLOW}[CONFIRM]${NC} $message (y/N): "
-    read -r response
+    read -r response < /dev/tty
     case "$response" in
         [yY]|[yY][eE][sS])
             return 0
