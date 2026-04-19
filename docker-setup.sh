@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.5"
+readonly SCRIPT_VERSION="2.2.1"
 readonly SCRIPT_NAME="docker-install"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
@@ -39,6 +39,7 @@ CURRENT_STEP=0
 DRY_RUN=false
 VERBOSE=false
 FORCE_YES=false
+CREATE_USER_NAME=""
 
 # ============================================================================
 # LOGGING & OUTPUT UTILITIES
@@ -56,53 +57,205 @@ print_step() {
 }
 
 print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-    log "SUCCESS: $1"
+    echo -e "${GREEN}[OK]${NC} $1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-    log "WARNING: $1"
+    echo -e "${YELLOW}[WARN]${NC} $1"
+    log "WARN: $1"
 }
 
 print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERR]${NC} $1"
     log "ERROR: $1"
 }
 
 print_info() {
-    echo -e "${CYAN}[INFO]${NC} $1"
-    log "INFO: $1"
+    echo -e "${CYAN}·${NC} $1"
 }
 
 print_verbose() {
     if [[ "$VERBOSE" == true ]]; then
-        echo -e "${PURPLE}[VERBOSE]${NC} $1"
+        echo -e "${PURPLE}[verbose]${NC} $1"
     fi
-    log "VERBOSE: $1"
 }
 
 progress_bar() {
     local current=$1
     local total=$2
-    local width=50
+    local width=44
     local percentage=$((current * 100 / total))
     local completed=$((current * width / total))
     local remaining=$((width - completed))
-    
-    printf "\rProgress: ["
-    printf "%*s" $completed | tr ' ' '='
-    printf "%*s" $remaining | tr ' ' '-'
-    printf "] %d%%" $percentage
-    
-    if [ $current -eq $total ]; then
-        echo
+    local rows
+
+    rows=$(tput lines 2>/dev/null) || rows=
+    if [[ -t 1 ]] && [[ "$rows" =~ ^[0-9]+$ ]] && [[ "$rows" -ge 3 ]]; then
+        # Pinned status line at bottom so scrolling apt/dpkg output does not erase it
+        printf '\033[s'
+        printf '\033[%s;1H' "$rows"
+        printf '\033[2K'
+        printf "%-12s [" "Progress"
+        printf "%*s" $completed | tr ' ' '='
+        printf "%*s" $remaining | tr ' ' '-'
+        printf "] %3d%%" "$percentage"
+        printf '\033[u'
+    else
+        printf "\r%-12s [" "Progress"
+        printf "%*s" $completed | tr ' ' '='
+        printf "%*s" $remaining | tr ' ' '-'
+        printf "] %3d%%\n" $percentage
     fi
+}
+
+# Apt: non-verbose mode sends full output to LOG_FILE so the TTY stays clean for the pinned progress bar.
+_apt() {
+    local aptq=()
+    [[ "$VERBOSE" != true ]] && aptq+=(-qq)
+    if [[ "$VERBOSE" == true ]]; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get "${aptq[@]}" "$@"
+        return $?
+    fi
+    {
+        echo "--- apt-get ${aptq[*]} $* @ $(date '+%Y-%m-%d %H:%M:%S') ---"
+        sudo DEBIAN_FRONTEND=noninteractive apt-get "${aptq[@]}" "$@"
+    } >>"$LOG_FILE" 2>&1 || {
+        print_error "apt-get failed (details in $LOG_FILE). Recent lines:"
+        tail -n 40 "$LOG_FILE" >&2 || true
+        return 1
+    }
+    return 0
+}
+
+# Fixes: sudo: unable to resolve host <hostname> when /etc/hosts lacks 127.0.1.1 mapping
+ensure_hosts_resolves_hostname() {
+    local hn
+    hn="$(hostname 2>/dev/null || true)"
+    [[ -z "$hn" ]] && return 0
+    if getent hosts "$hn" >/dev/null 2>&1; then
+        return 0
+    fi
+    if grep "127.0.1.1" /etc/hosts 2>/dev/null | grep -qF "$hn"; then
+        return 0
+    fi
+    if [[ "$DRY_RUN" == true ]]; then
+        return 0
+    fi
+    printf '127.0.1.1\t%s\n' "$hn" | sudo tee -a /etc/hosts >/dev/null
+    print_verbose "Mapped hostname $hn in /etc/hosts (fixes sudo DNS warning)"
 }
 
 # ============================================================================
 # VALIDATION & SAFETY CHECKS
 # ============================================================================
+
+sudo_group_name() {
+    if getent group sudo >/dev/null 2>&1; then
+        echo sudo
+    elif getent group wheel >/dev/null 2>&1; then
+        echo wheel
+    fi
+}
+
+is_valid_unix_username() {
+    local name="$1"
+    [[ "$name" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+handle_running_as_root() {
+    local new_user=""
+    local script_dir script_path filtered_args
+
+    if [[ "$DRY_RUN" == true ]]; then
+        print_warning "As root: omit --dry-run to create a sudo user, or run this script as a non-root user."
+        exit $EXIT_PERMISSION_ERROR
+    fi
+
+    echo ""
+    echo -e "${YELLOW}[root]${NC} Docker installs should run as a ${GREEN}sudo user${NC}, not root."
+    if [[ -n "$CREATE_USER_NAME" ]]; then
+        new_user="$CREATE_USER_NAME"
+        if ! is_valid_unix_username "$new_user"; then
+            print_error "Invalid username: 1–32 chars, [a-z0-9_-], must start with letter or _"
+            exit $EXIT_INVALID_ARGS
+        fi
+    elif [[ "$FORCE_YES" == true ]]; then
+        print_error "Root + --yes needs --create-user USER (example: $0 --yes --create-user myuser)"
+        exit $EXIT_PERMISSION_ERROR
+    elif confirm_action "Create a sudo user and continue as them?"; then
+        local response=""
+        echo -en "${YELLOW}?${NC} Username [dockeruser]: " >&2
+        if [[ -c /dev/tty ]] && read -r response < /dev/tty; then
+            :
+        elif [[ -t 0 ]]; then
+            read -r response
+        else
+            print_error "No TTY: pass --create-user NAME when running as root"
+            exit $EXIT_PERMISSION_ERROR
+        fi
+        new_user="${response:-dockeruser}"
+        if ! is_valid_unix_username "$new_user"; then
+            print_error "Invalid username: 1–32 chars, [a-z0-9_-], must start with letter or _"
+            exit $EXIT_INVALID_ARGS
+        fi
+    else
+        echo "  Exit, log in as a sudo-capable user, and run this script again (or: $0 --create-user NAME)."
+        exit $EXIT_PERMISSION_ERROR
+    fi
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+
+    if [[ ! -f "$script_path" ]]; then
+        print_error "Cannot resolve script path: $script_path"
+        exit $EXIT_INVALID_ARGS
+    fi
+
+    local grp
+    grp="$(sudo_group_name)"
+    if [[ -z "$grp" ]]; then
+        print_error "Neither 'sudo' nor 'wheel' group found; cannot grant the new user admin privileges."
+        exit $EXIT_PERMISSION_ERROR
+    fi
+
+    if id "$new_user" &>/dev/null; then
+        if ! confirm_action "User '$new_user' exists — switch to them and continue?"; then
+            exit $EXIT_PERMISSION_ERROR
+        fi
+    else
+        print_verbose "useradd -m -G $grp $new_user"
+        if ! useradd -m -s /bin/bash -G "$grp" "$new_user"; then
+            print_error "useradd failed for '$new_user'"
+            exit $EXIT_PERMISSION_ERROR
+        fi
+        if [[ "$FORCE_YES" == true ]]; then
+            print_warning "No password set (--yes); run: passwd $new_user"
+        else
+            echo -e "${CYAN}·${NC} Password for ${GREEN}$new_user${NC}:"
+            if ! passwd "$new_user"; then
+                print_error "passwd failed; cleanup: userdel -r $new_user"
+                exit $EXIT_PERMISSION_ERROR
+            fi
+        fi
+    fi
+
+    filtered_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --create-user)
+                shift
+                [[ $# -gt 0 ]] && shift
+                ;;
+            *)
+                filtered_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    print_success "Continuing as ${GREEN}$new_user${NC} → re-running script"
+    exec sudo -H -u "$new_user" -- bash "$script_path" "${filtered_args[@]}"
+}
 
 install_curl_if_missing() {
     # Check if curl is already installed
@@ -127,8 +280,8 @@ install_curl_if_missing() {
     local install_success=false
     
     if command -v apt-get >/dev/null 2>&1; then
-        print_info "Using apt-get to install curl..."
-        if sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y curl 2>/dev/null; then
+        print_verbose "apt install curl"
+        if _apt update && _apt install -y curl; then
             install_success=true
         fi
     elif command -v dnf >/dev/null 2>&1; then
@@ -198,21 +351,22 @@ check_required_commands() {
 validate_environment() {
     print_verbose "Validating script environment"
     
-    # Check if running as root
+    # Non-root: refuse continuing as root (root flow should have re-exec'd before this)
     if [[ $EUID -eq 0 ]]; then
-        print_error "This script should not be run as root for security reasons"
-        print_info "Run as a regular user with sudo privileges"
+        print_error "Still running as root after user handoff — this should not happen"
         exit $EXIT_PERMISSION_ERROR
     fi
     
     # Validate sudo access
     if ! sudo -n true 2>/dev/null; then
-        print_info "Checking sudo privileges..."
+        print_verbose "sudo credentials"
         if ! sudo -v; then
             print_error "Sudo access required but not available"
             exit $EXIT_PERMISSION_ERROR
         fi
     fi
+
+    ensure_hosts_resolves_hostname
     
     # Keep sudo alive in background
     (while true; do sudo -n true; sleep 50; done 2>/dev/null) &
@@ -301,40 +455,44 @@ detect_system() {
 # ============================================================================
 
 install_dependencies_debian() {
-    print_verbose "Checking and installing dependencies for Debian/Ubuntu/Raspberry Pi OS"
+    print_verbose "apt dependencies ($DISTRO)"
     
+    # software-properties-common is Ubuntu-centric; Docker repo here uses signed sources.list (no add-apt-repository).
     local required_deps=(
         "ca-certificates"
         "curl"
         "gnupg"
         "lsb-release"
-        "software-properties-common"
-        "apt-transport-https"
     )
+    if [[ "$DISTRO" == "ubuntu" ]]; then
+        required_deps+=("apt-transport-https")
+    fi
     
     local missing_deps=()
     
-    # Check which dependencies are missing
     for dep in "${required_deps[@]}"; do
         if ! dpkg -l "$dep" 2>/dev/null | grep -q '^ii'; then
             missing_deps+=("$dep")
-            print_verbose "Missing dependency: $dep"
+            print_verbose "missing: $dep"
         fi
     done
     
     if [[ ${#missing_deps[@]} -eq 0 ]]; then
-        print_success "All dependencies already installed"
+        print_success "Dependencies OK"
         return 0
     fi
     
-    print_info "Installing missing dependencies: ${missing_deps[*]}"
-    
-    if [[ "$DRY_RUN" == false ]]; then
-        retry_command 3 5 sudo apt-get update
-        retry_command 3 5 sudo apt-get install -y "${missing_deps[@]}"
+    if [[ "$DRY_RUN" == true ]]; then
+        print_verbose "dry-run: would install ${missing_deps[*]}"
+        return 0
     fi
     
-    print_success "Dependencies installed successfully"
+    echo -e "${CYAN}·${NC} Installing: ${missing_deps[*]} (details -> log unless ${CYAN}--verbose${NC})"
+    progress_bar "$CURRENT_STEP" "$TOTAL_STEPS"
+    retry_command 3 5 _apt update
+    progress_bar "$CURRENT_STEP" "$TOTAL_STEPS"
+    retry_command 3 5 _apt install -y "${missing_deps[@]}"
+    print_success "Dependencies installed"
 }
 
 install_dependencies_rhel() {
@@ -423,8 +581,7 @@ confirm_action() {
     fi
     
     local response=""
-    # Print prompt to stderr to ensure visibility even if stdout is redirected
-    echo -en "${YELLOW}[CONFIRM]${NC} $message (y/N): " >&2
+    echo -en "${YELLOW}?${NC} $message ${CYAN}[y/N]${NC}: " >&2
     
     # Check if we have a controlling terminal
     if [[ -c /dev/tty ]]; then
@@ -463,7 +620,9 @@ retry_command() {
     local cmd=("$@")
     
     for ((i=1; i<=max_attempts; i++)); do
-        print_verbose "Attempt $i/$max_attempts: ${cmd[*]}"
+        if [[ "$VERBOSE" == true ]]; then
+            print_verbose "Attempt $i/$max_attempts: ${cmd[*]}"
+        fi
         
         if "${cmd[@]}"; then
             return 0
@@ -507,7 +666,7 @@ remove_old_docker_ubuntu_debian() {
     
     if [[ ${#installed_packages[@]} -gt 0 ]]; then
         print_info "Removing old Docker packages: ${installed_packages[*]}"
-        retry_command 3 2 sudo apt-get remove -y "${installed_packages[@]}"
+        retry_command 3 2 _apt remove -y "${installed_packages[@]}"
     else
         print_verbose "No old Docker packages found to remove"
     fi
@@ -554,15 +713,18 @@ remove_old_docker_arch() {
 # ============================================================================
 
 install_docker_ubuntu_debian() {
-    print_verbose "Installing Docker on Ubuntu/Debian/Raspberry Pi OS"
+    print_verbose "install_docker_ubuntu_debian"
     
-    # Update package index
-    print_info "Updating package index..."
-    retry_command 3 5 sudo apt-get update
+    if [[ "$DRY_RUN" == true ]]; then
+        print_verbose "dry-run: skip docker install"
+        return 0
+    fi
     
-    # Setup Docker repository
-    print_info "Setting up Docker repository..."
-    if [[ "$DRY_RUN" == false ]]; then
+    progress_bar "$CURRENT_STEP" "$TOTAL_STEPS"
+    retry_command 3 5 _apt update
+    
+    print_verbose "docker.list + keyring"
+    {
         # Create keyrings directory with secure permissions
         sudo install -m 0755 -d /etc/apt/keyrings
         
@@ -580,20 +742,17 @@ install_docker_ubuntu_debian() {
         local repo_line="deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${DISTRO} ${CODENAME} stable"
         echo "$repo_line" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
         
-        # Update package index with new repository
-        retry_command 3 5 sudo apt-get update
-    fi
+        retry_command 3 5 _apt update
+    }
     
-    # Install Docker packages
     local docker_packages=(
         "docker-ce" "docker-ce-cli" "containerd.io"
         "docker-buildx-plugin" "docker-compose-plugin"
     )
     
-    print_info "Installing Docker packages: ${docker_packages[*]}"
-    if [[ "$DRY_RUN" == false ]]; then
-        retry_command 3 5 sudo apt-get install -y "${docker_packages[@]}"
-    fi
+    echo -e "${CYAN}·${NC} docker-ce, compose plugin, buildx… (apt -> log unless ${CYAN}--verbose${NC})"
+    progress_bar "$CURRENT_STEP" "$TOTAL_STEPS"
+    retry_command 3 5 _apt install -y "${docker_packages[@]}"
 }
 
 install_docker_rhel_family() {
@@ -724,26 +883,22 @@ install_docker() {
             ;;
     esac
     
-    print_success "Docker packages installed successfully"
+    if [[ "$DRY_RUN" == false ]]; then
+        print_success "Docker installed"
+    fi
 }
 
 configure_docker_service() {
-    print_verbose "Configuring Docker service"
+    print_verbose "systemd + docker group"
     
     if [[ "$DRY_RUN" == true ]]; then
-        print_info "DRY RUN: Would configure Docker service and add user to docker group"
+        print_verbose "DRY RUN: usermod + systemctl"
         return 0
     fi
     
-    # Add user to docker group
-    print_info "Adding user '$USER' to docker group..."
+    echo -e "${CYAN}·${NC} group docker <- ${GREEN}$USER${NC}; systemctl enable --now docker"
     sudo usermod -aG docker "$USER"
-    
-    # Start and enable Docker service
-    print_info "Starting Docker service..."
     sudo systemctl start docker
-    
-    print_info "Enabling Docker service for auto-start..."
     sudo systemctl enable docker
     
     # Wait for service to be ready
@@ -800,21 +955,17 @@ verify_installation() {
 }
 
 run_docker_test() {
-    print_verbose "Running Docker functionality test"
+    print_verbose "hello-world"
     
     if [[ "$DRY_RUN" == true ]]; then
-        print_info "DRY RUN: Would test Docker with hello-world container"
         return 0
     fi
     
-    print_info "Testing Docker with hello-world container..."
-    
-    # Try to run hello-world container with sudo (since user may not be in docker group yet)
+    echo -e "${CYAN}·${NC} docker run hello-world (quick check)…"
     if timeout 60 sudo docker run --rm hello-world >/dev/null 2>&1; then
-        print_success "Docker test completed successfully"
+        print_success "hello-world OK"
     else
-        print_warning "Docker test failed - you may need to logout and login again"
-        print_info "Try running: newgrp docker"
+        print_warning "hello-world failed — try ${CYAN}newgrp docker${NC} or re-login"
     fi
 }
 
@@ -832,6 +983,8 @@ OPTIONS:
     --dry-run       Show what would be done without executing
     --verbose       Enable verbose output
     --yes           Skip confirmation prompts
+    --create-user USER
+                    When run as root (with --yes): create or use USER, then re-run as that user
     --help          Show this help message
 
 EXAMPLES:
@@ -839,6 +992,7 @@ EXAMPLES:
     $0 --verbose          # Installation with detailed output
     $0 --dry-run          # Preview what will be installed
     $0 --yes --verbose    # Automated verbose installation
+    sudo $0 --yes --create-user deploy   # As root: ensure user 'deploy', then install as deploy
 
 SUPPORTED DISTRIBUTIONS:
     - Ubuntu 20.04+ (including 24.04 LTS)
@@ -859,17 +1013,23 @@ parse_arguments() {
         case $1 in
             --dry-run)
                 DRY_RUN=true
-                print_info "Dry run mode enabled"
                 shift
                 ;;
             --verbose)
                 VERBOSE=true
-                print_info "Verbose mode enabled"
                 shift
                 ;;
             --yes)
                 FORCE_YES=true
-                print_info "Auto-confirmation enabled"
+                shift
+                ;;
+            --create-user)
+                shift
+                if [[ $# -lt 1 || "$1" == -* ]]; then
+                    print_error "--create-user requires a username"
+                    exit $EXIT_INVALID_ARGS
+                fi
+                CREATE_USER_NAME="$1"
                 shift
                 ;;
             --help|-h)
@@ -883,45 +1043,42 @@ parse_arguments() {
                 ;;
         esac
     done
+    
+    if [[ $EUID -ne 0 && -n "$CREATE_USER_NAME" ]]; then
+        print_error "--create-user is only valid when running this script as root"
+        exit $EXIT_INVALID_ARGS
+    fi
 }
 
 show_summary() {
     echo
-    echo "Installation Summary"
-    echo "==================="
+    echo -e "${BLUE}── Done ──${NC}"
     
     if [[ "$DRY_RUN" == false ]]; then
-        docker --version 2>/dev/null || echo "Docker: Not accessible"
-        docker compose version 2>/dev/null || echo "Docker Compose: Not accessible"
-        
-        echo
-        echo "System Information:"
-        echo "  Distribution: $DISTRO $VERSION"
-        echo "  Architecture: $ARCH"
-        echo "  User: $USER"
-        echo "  Log file: $LOG_FILE"
+        docker --version 2>/dev/null || echo "Docker: n/a"
+        docker compose version 2>/dev/null || echo "Compose: n/a"
+        echo -e "  ${DISTRO} ${VERSION} · ${ARCH} · ${USER}"
+        if [[ "$VERBOSE" == true ]]; then
+            echo "  Log: $LOG_FILE"
+        fi
     else
-        echo "DRY RUN completed - no changes made"
+        echo "  (dry run — no changes)"
     fi
     
     echo
     if [[ "$DRY_RUN" == false ]]; then
-        print_success "Docker installation completed successfully!"
-        print_warning "IMPORTANT: Log out and log back in to use Docker without sudo"
-        print_info "Or run: newgrp docker"
+        print_success "Docker is installed"
+        print_warning "Re-login (or ${CYAN}newgrp docker${NC}) to use Docker without sudo"
     fi
 }
 
 main() {
-    # Step 0: Ensure curl is present (crucial for installation)
-    # This must run before any other logic that might depend on curl
-    install_curl_if_missing
+    echo "Docker setup v${SCRIPT_VERSION} · ${LOG_FILE}" > "$LOG_FILE"
 
-    # Initialize logging
-    echo "Docker Installation Script v${SCRIPT_VERSION} started at $(date)" > "$LOG_FILE"
+    # Step 0: Ensure curl is present (must run after log exists — _apt appends there when not verbose)
+    install_curl_if_missing
     
-    echo "Docker Installation Script"
-    echo "=========================="
+    echo -e "${BLUE}Docker setup${NC} v${SCRIPT_VERSION}"
     echo
     
     # Step 1: Parse command line arguments
@@ -935,7 +1092,12 @@ main() {
     check_required_commands
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
-    # Step 3: Environment validation
+    # Step 3: If running as root, offer/create a non-root user and re-exec (or exit)
+    if [[ $EUID -eq 0 ]]; then
+        handle_running_as_root "$@"
+    fi
+    
+    # Step 3b: Environment validation (non-root)
     print_step "Validating environment and permissions"
     validate_environment
     progress_bar $CURRENT_STEP $TOTAL_STEPS
@@ -951,16 +1113,14 @@ main() {
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
     # Step 6: Display installation plan
-    print_step "Preparing installation plan"
-    echo "  Target system: $DISTRO $VERSION ($ARCH)"
-    echo "  Installation mode: $([ "$DRY_RUN" == true ] && echo "DRY RUN" || echo "LIVE")"
-    echo "  Log file: $LOG_FILE"
+    print_step "Installation plan"
+    echo -e "  ${DISTRO} ${VERSION} (${ARCH}) · $([ "$DRY_RUN" == true ] && echo "dry-run" || echo "live")"
     progress_bar $CURRENT_STEP $TOTAL_STEPS
     
     # Step 7: Confirm installation
     print_step "Confirming installation"
     if ! confirm_action "Proceed with Docker installation on $DISTRO $VERSION?"; then
-        print_info "Installation cancelled by user"
+        echo "Cancelled."
         exit $EXIT_SUCCESS
     fi
     progress_bar $CURRENT_STEP $TOTAL_STEPS
