@@ -9,8 +9,9 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.2.1"
+readonly SCRIPT_VERSION="2.2.2"
 readonly SCRIPT_NAME="docker-install"
+readonly SCRIPT_URL="https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
 
 # Exit codes
@@ -203,12 +204,29 @@ handle_running_as_root() {
         exit $EXIT_PERMISSION_ERROR
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)" || script_dir=""
+    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]:-}")"
 
     if [[ ! -f "$script_path" ]]; then
-        print_error "Cannot resolve script path: $script_path"
-        exit $EXIT_INVALID_ARGS
+        # Piped execution (curl/wget | bash): the script never existed on disk,
+        # so fetch a copy to hand off to the new user.
+        print_info "Piped execution detected — fetching script copy for user handoff"
+        script_path="$(mktemp "/tmp/${SCRIPT_NAME}-handoff-XXXXXX.sh")"
+        if command -v curl >/dev/null 2>&1; then
+            if ! curl -fsSL "$SCRIPT_URL" -o "$script_path"; then
+                print_error "Failed to download script from $SCRIPT_URL"
+                exit $EXIT_NETWORK_ERROR
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if ! wget -qO "$script_path" "$SCRIPT_URL"; then
+                print_error "Failed to download script from $SCRIPT_URL"
+                exit $EXIT_NETWORK_ERROR
+            fi
+        else
+            print_error "Cannot resolve script path and neither curl nor wget is available"
+            exit $EXIT_MISSING_DEPS
+        fi
+        chmod 644 "$script_path"
     fi
 
     local grp
