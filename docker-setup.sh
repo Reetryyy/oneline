@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.3.0"
+readonly SCRIPT_VERSION="2.3.1"
 readonly SCRIPT_NAME="docker-install"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
@@ -177,7 +177,7 @@ handle_running_as_root() {
 
     # Piped execution (wget/curl | bash): stdin is the pipe, not a terminal.
     # Interactive prompts (username, passwd) won't work — fail fast with a clear fix.
-    if [[ ! -t 0 ]] && [[ ! -c /dev/tty ]]; then
+    if [[ ! -t 0 ]]; then
         print_error "Piped execution detected — cannot prompt interactively as root."
         echo    "  Re-run with explicit flags:"
         echo -e "    ${CYAN}wget -qO- ${SCRIPT_URL} | bash -s -- --yes --create-user ${GREEN}USERNAME${NC}"
