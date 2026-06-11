@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.2.2"
+readonly SCRIPT_VERSION="2.2.3"
 readonly SCRIPT_NAME="docker-install"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
@@ -250,7 +250,7 @@ handle_running_as_root() {
             print_warning "No password set (--yes); run: passwd $new_user"
         else
             echo -e "${CYAN}·${NC} Password for ${GREEN}$new_user${NC}:"
-            if ! passwd "$new_user"; then
+            if ! passwd "$new_user" </dev/tty; then
                 print_error "passwd failed; cleanup: userdel -r $new_user"
                 exit $EXIT_PERMISSION_ERROR
             fi
