@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.2.3"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="docker-install"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
@@ -165,7 +165,7 @@ is_valid_unix_username() {
 
 handle_running_as_root() {
     local new_user=""
-    local script_dir script_path filtered_args
+    local filtered_args
 
     if [[ "$DRY_RUN" == true ]]; then
         print_warning "As root: omit --dry-run to create a sudo user, or run this script as a non-root user."
@@ -174,6 +174,17 @@ handle_running_as_root() {
 
     echo ""
     echo -e "${YELLOW}[root]${NC} Docker installs should run as a ${GREEN}sudo user${NC}, not root."
+
+    # Piped execution (wget/curl | bash): stdin is the pipe, not a terminal.
+    # Interactive prompts (username, passwd) won't work — fail fast with a clear fix.
+    if [[ ! -t 0 ]] && [[ ! -c /dev/tty ]]; then
+        print_error "Piped execution detected — cannot prompt interactively as root."
+        echo    "  Re-run with explicit flags:"
+        echo -e "    ${CYAN}wget -qO- ${SCRIPT_URL} | bash -s -- --yes --create-user ${GREEN}USERNAME${NC}"
+        echo    "  (No password will be set; run 'passwd USERNAME' afterwards.)"
+        exit $EXIT_PERMISSION_ERROR
+    fi
+
     if [[ -n "$CREATE_USER_NAME" ]]; then
         new_user="$CREATE_USER_NAME"
         if ! is_valid_unix_username "$new_user"; then
@@ -186,47 +197,26 @@ handle_running_as_root() {
     elif confirm_action "Create a sudo user and continue as them?"; then
         local response=""
         echo -en "${YELLOW}?${NC} Username [dockeruser]: " >&2
-        if [[ -c /dev/tty ]] && read -r response < /dev/tty; then
-            :
-        elif [[ -t 0 ]]; then
-            read -r response
-        else
-            print_error "No TTY: pass --create-user NAME when running as root"
-            exit $EXIT_PERMISSION_ERROR
-        fi
+        read -r response < /dev/tty
         new_user="${response:-dockeruser}"
         if ! is_valid_unix_username "$new_user"; then
             print_error "Invalid username: 1–32 chars, [a-z0-9_-], must start with letter or _"
             exit $EXIT_INVALID_ARGS
         fi
     else
-        echo "  Exit, log in as a sudo-capable user, and run this script again (or: $0 --create-user NAME)."
+        echo "  Exit, log in as a sudo-capable user, and run this script again."
+        echo "  Or: $0 --create-user NAME"
         exit $EXIT_PERMISSION_ERROR
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd)" || script_dir=""
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]:-}")"
+    # Resolve script path for re-exec (only reachable with a real TTY, so file must exist)
+    local script_dir script_path
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
 
     if [[ ! -f "$script_path" ]]; then
-        # Piped execution (curl/wget | bash): the script never existed on disk,
-        # so fetch a copy to hand off to the new user.
-        print_info "Piped execution detected — fetching script copy for user handoff"
-        script_path="$(mktemp "/tmp/${SCRIPT_NAME}-handoff-XXXXXX.sh")"
-        if command -v curl >/dev/null 2>&1; then
-            if ! curl -fsSL "$SCRIPT_URL" -o "$script_path"; then
-                print_error "Failed to download script from $SCRIPT_URL"
-                exit $EXIT_NETWORK_ERROR
-            fi
-        elif command -v wget >/dev/null 2>&1; then
-            if ! wget -qO "$script_path" "$SCRIPT_URL"; then
-                print_error "Failed to download script from $SCRIPT_URL"
-                exit $EXIT_NETWORK_ERROR
-            fi
-        else
-            print_error "Cannot resolve script path and neither curl nor wget is available"
-            exit $EXIT_MISSING_DEPS
-        fi
-        chmod 644 "$script_path"
+        print_error "Cannot resolve script path: $script_path"
+        exit $EXIT_INVALID_ARGS
     fi
 
     local grp
@@ -250,7 +240,7 @@ handle_running_as_root() {
             print_warning "No password set (--yes); run: passwd $new_user"
         else
             echo -e "${CYAN}·${NC} Password for ${GREEN}$new_user${NC}:"
-            if ! passwd "$new_user" </dev/tty; then
+            if ! passwd "$new_user" < /dev/tty; then
                 print_error "passwd failed; cleanup: userdel -r $new_user"
                 exit $EXIT_PERMISSION_ERROR
             fi
