@@ -9,7 +9,7 @@ set -euo pipefail
 # CONFIGURATION & CONSTANTS
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.3.1"
+readonly SCRIPT_VERSION="2.4.0"
 readonly SCRIPT_NAME="docker-install"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/Reetryyy/oneline/main/docker-setup.sh"
 readonly LOG_FILE="/tmp/${SCRIPT_NAME}-$(date +%Y%m%d-%H%M%S).log"
@@ -175,16 +175,6 @@ handle_running_as_root() {
     echo ""
     echo -e "${YELLOW}[root]${NC} Docker installs should run as a ${GREEN}sudo user${NC}, not root."
 
-    # Piped execution (wget/curl | bash): stdin is the pipe, not a terminal.
-    # Interactive prompts (username, passwd) won't work — fail fast with a clear fix.
-    if [[ ! -t 0 ]]; then
-        print_error "Piped execution detected — cannot prompt interactively as root."
-        echo    "  Re-run with explicit flags:"
-        echo -e "    ${CYAN}wget -qO- ${SCRIPT_URL} | bash -s -- --yes --create-user ${GREEN}USERNAME${NC}"
-        echo    "  (No password will be set; run 'passwd USERNAME' afterwards.)"
-        exit $EXIT_PERMISSION_ERROR
-    fi
-
     if [[ -n "$CREATE_USER_NAME" ]]; then
         new_user="$CREATE_USER_NAME"
         if ! is_valid_unix_username "$new_user"; then
@@ -209,14 +199,22 @@ handle_running_as_root() {
         exit $EXIT_PERMISSION_ERROR
     fi
 
-    # Resolve script path for re-exec (only reachable with a real TTY, so file must exist)
-    local script_dir script_path
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
-
+    # Resolve the script path for re-exec.
+    # In piped execution (wget | bash) BASH_SOURCE[0] is just "bash" — no file on disk.
+    # Download a fresh copy to a temp file so sudo -u can exec it.
+    local script_path
+    script_path="${BASH_SOURCE[0]:-}"
     if [[ ! -f "$script_path" ]]; then
-        print_error "Cannot resolve script path: $script_path"
-        exit $EXIT_INVALID_ARGS
+        print_info "Fetching script for user handoff…"
+        local tmp
+        tmp="$(mktemp "/tmp/${SCRIPT_NAME}-XXXXXX.sh")"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$SCRIPT_URL" -o "$tmp" || { print_error "Download failed"; exit $EXIT_NETWORK_ERROR; }
+        else
+            wget -qO "$tmp" "$SCRIPT_URL" || { print_error "Download failed"; exit $EXIT_NETWORK_ERROR; }
+        fi
+        chmod 644 "$tmp"
+        script_path="$tmp"
     fi
 
     local grp
